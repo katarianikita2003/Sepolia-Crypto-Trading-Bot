@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import {FlashLoanSimpleReceiverBase} from "@aave/core-v3/contracts/flashloan/base/FlashLoanSimpleReceiverBase.sol";
+import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+// Uniswap V3 Interfaces
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+interface IUniswapV3Pool {
+    function slot0() external view returns (
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint16 observationIndex,
+        uint16 observationCardinality,
+        uint16 observationCardinalityNext,
+        uint8 feeProtocol,
+        bool unlocked
+    );
+}
+
+interface IUniswapV3Factory {
+    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+}
+
+/**
+ * @title Enhanced ArbitrageBot with Flash Loan Market Manipulation
+ * @dev Creates arbitrage opportunities through flash loan market manipulation
+ */
+contract EnhancedArbitrageBot is FlashLoanSimpleReceiverBase, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // DEX Router Addresses
+    address public constant UNISWAP_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address public constant SUSHISWAP_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    address public constant UNISWAP_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
+
+    // Flash Loan Configuration
+    uint256 public constant FLASH_LOAN_FEE = 9; // 0.09% (9 basis points)
+    uint256 public constant BASIS_POINTS = 10000;
+    
+    // Arbitrage Configuration
+    uint256 public minProfitBasisPoints = 50; // 0.5% minimum profit
+    uint256 public maxSlippageBasisPoints = 300; // 3% max slippage
+    uint256 public manipulationThreshold = 1000000; // $1M equivalent for manipulation
+
+    // Events
+    event ArbitrageExecuted(
+        address indexed token,
+        uint256 flashLoanAmount,
+        uint256 profit,
+        uint256 gasUsed
+    );
+    
+    event MarketManipulated(
+        address indexed token,
+        address indexed pool,
+        uint256 impactAmount,
+        uint256 priceImpact
+    );
+
+    struct ArbitrageParams {
+        address tokenA;           // Token to manipulate
+        address tokenB;           // Paired token
+        uint24 fee;              // Pool fee (500, 3000, 10000)
+        uint256 flashAmount;     // Flash loan amount
+        bool manipulateUp;       // True = pump tokenA, False = dump tokenA
+        uint256 minProfit;       // Minimum expected profit
+    }
+
+    constructor(address _addressesProvider) 
+        FlashLoanSimpleReceiverBase(IPoolAddressesProvider(_addressesProvider)) 
+    {}
+
+    /**
+     * @dev Execute market manipulation arbitrage
+     * @param params Arbitrage parameters
+     */
+    function executeManipulationArbitrage(ArbitrageParams calldata params) 
+        external 
+        onlyOwner 
+        nonReentrant 
+    {
+        require(params.flashAmount > 0, "Invalid flash amount");
+        require(params.minProfit > 0, "Invalid min profit");
+        
+        // Encode parameters for flash loan callback
+        bytes memory data = abi.encode(params);
+        
+        // Initiate flash loan
+        address asset = params.manipulateUp ? params.tokenB : params.tokenA;
+        POOL.flashLoanSimple(address(this), asset, params.flashAmount, data, 0);
+    }
+
+    /**
+     * @dev Flash loan callback - executes the manipulation arbitrage
+     */
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(msg.sender == address(POOL), "Invalid caller");
+        require(initiator == address(this), "Invalid initiator");
+
+        // Decode parameters
+        ArbitrageParams memory arbParams = abi.decode(params, (ArbitrageParams));
+        
+        uint256 startBalance = IERC20(asset).balanceOf(address(this));
+        uint256 totalDebt = amount + premium;
+
+        // Step 1: Market Manipulation
+        uint256 manipulationProfit = _executeMarketManipulation(arbParams, amount);
+        
+        // Step 2: Validate profit after costs
+        uint256 finalBalance = IERC20(asset).balanceOf(address(this));
+        require(finalBalance >= totalDebt, "Insufficient funds to repay");
+        
+        uint256 actualProfit = finalBalance - startBalance - totalDebt;
+        require(actualProfit >= arbParams.minProfit, "Profit below minimum");
+
+        // Step 3: Approve repayment
+        IERC20(asset).safeApprove(address(POOL), totalDebt);
+
+        emit ArbitrageExecuted(asset, amount, actualProfit, gasleft());
+        
+        return true;
+    }
+
+    /**
+     * @dev Execute market manipulation strategy
+     */
+    function _executeMarketManipulation(
+        ArbitrageParams memory params,
+        uint256 flashAmount
+    ) internal returns (uint256 profit) {
+        
+        if (params.manipulateUp) {
+            // Strategy: Pump tokenA, then sell at higher price
+            profit = _executePumpAndDump(params, flashAmount);
+        } else {
+            // Strategy: Dump tokenA, then buy at lower price  
+            profit = _executeDumpAndPump(params, flashAmount);
+        }
+    }
+
+    /**
+     * @dev Pump and Dump Strategy
+     * 1. Use flash loan (tokenB) to buy tokenA (pump price)
+     * 2. Sell tokenA on different DEX at higher price
+     * 3. Convert back to tokenB and repay loan
+     */
+    function _executePumpAndDump(
+        ArbitrageParams memory params,
+        uint256 flashAmount
+    ) internal returns (uint256 profit) {
+        
+        // Step 1: Pump tokenA by buying with flash loan tokenB
+        uint256 tokenABought = _swapOnUniswap(
+            params.tokenB,
+            params.tokenA, 
+            params.fee,
+            flashAmount,
+            0 // Accept any amount
+        );
+
+        emit MarketManipulated(
+            params.tokenA,
+            _getPoolAddress(params.tokenA, params.tokenB, params.fee),
+            flashAmount,
+            0 // TODO: Calculate actual price impact
+        );
+
+        // Step 2: Sell tokenA on SushiSwap at inflated price
+        uint256 tokenBReceived = _swapOnSushiswap(
+            params.tokenA,
+            params.tokenB,
+            tokenABought,
+            flashAmount // Expect at least flash amount back
+        );
+
+        // Step 3: Calculate profit
+        profit = tokenBReceived > flashAmount ? tokenBReceived - flashAmount : 0;
+    }
+
+    /**
+     * @dev Dump and Pump Strategy  
+     * 1. Dump tokenA (using flash loan) to crash price
+     * 2. Buy tokenA cheap on different DEX
+     * 3. Let price recover and sell at normal price
+     */
+    function _executeDumpAndPump(
+        ArbitrageParams memory params,
+        uint256 flashAmount
+    ) internal returns (uint256 profit) {
+        
+        // Step 1: Dump tokenA to crash price on Uniswap
+        uint256 tokenBReceived = _swapOnUniswap(
+            params.tokenA,
+            params.tokenB,
+            params.fee, 
+            flashAmount,
+            0 // Accept any amount
+        );
+
+        emit MarketManipulated(
+            params.tokenA,
+            _getPoolAddress(params.tokenA, params.tokenB, params.fee),
+            flashAmount,
+            0 // TODO: Calculate actual price impact
+        );
+
+        // Step 2: Buy tokenA cheap on SushiSwap
+        uint256 tokenABought = _swapOnSushiswap(
+            params.tokenB,
+            params.tokenA,
+            tokenBReceived * 95 / 100, // Use 95% of received tokenB
+            0 // Accept any amount
+        );
+
+        // Step 3: Wait for price recovery (in practice, this happens immediately)
+        // Then sell tokenA back at recovered price
+        uint256 finalTokenB = _swapOnUniswap(
+            params.tokenA,
+            params.tokenB,
+            params.fee,
+            tokenABought,
+            flashAmount // Need at least flash amount to repay
+        );
+
+        // Step 4: Calculate profit
+        profit = finalTokenB > flashAmount ? finalTokenB - flashAmount : 0;
+    }
+
+    /**
+     * @dev Swap tokens on Uniswap V3
+     */
+    function _swapOnUniswap(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint256 amountOutMinimum
+    ) internal returns (uint256 amountOut) {
+        
+        IERC20(tokenIn).safeApprove(UNISWAP_V3_ROUTER, amountIn);
+        
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: fee,
+            recipient: address(this),
+            deadline: block.timestamp + 300, // 5 minutes
+            amountIn: amountIn,
+            amountOutMinimum: amountOutMinimum,
+            sqrtPriceLimitX96: 0
+        });
+
+        amountOut = ISwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(params);
+    }
+
+    /**
+     * @dev Swap tokens on SushiSwap (V2 style)
+     */
+    function _swapOnSushiswap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMinimum
+    ) internal returns (uint256 amountOut) {
+        
+        IERC20(tokenIn).safeApprove(SUSHISWAP_ROUTER, amountIn);
+        
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+
+        // Use SushiSwap V2 interface
+        (bool success, bytes memory data) = SUSHISWAP_ROUTER.call(
+            abi.encodeWithSignature(
+                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+                amountIn,
+                amountOutMinimum,
+                path,
+                address(this),
+                block.timestamp + 300
+            )
+        );
+
+        require(success, "SushiSwap swap failed");
+        uint256[] memory amounts = abi.decode(data, (uint256[]));
+        amountOut = amounts[amounts.length - 1];
+    }
+
+    /**
+     * @dev Get Uniswap V3 pool address
+     */
+    function _getPoolAddress(address tokenA, address tokenB, uint24 fee) 
+        internal 
+        view 
+        returns (address) 
+    {
+        return IUniswapV3Factory(UNISWAP_V3_FACTORY).getPool(tokenA, tokenB, fee);
+    }
+
+    /**
+     * @dev Calculate optimal flash loan amount based on pool liquidity
+     */
+    function calculateOptimalFlashAmount(
+        address tokenA,
+        address tokenB, 
+        uint24 fee
+    ) external view returns (uint256 optimalAmount) {
+        
+        address pool = _getPoolAddress(tokenA, tokenB, fee);
+        require(pool != address(0), "Pool does not exist");
+        
+        // Get current price and liquidity
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        
+        // Calculate optimal amount (simplified - should use more sophisticated calculation)
+        // Target 1-5% price impact for manipulation
+        uint256 poolBalance = IERC20(tokenA).balanceOf(pool);
+        optimalAmount = poolBalance * 5 / 100; // 5% of pool balance
+        
+        // Cap at maximum reasonable amount
+        if (optimalAmount > 1000000 * 10**18) { // Cap at 1M tokens
+            optimalAmount = 1000000 * 10**18;
+        }
+    }
+
+    /**
+     * @dev Check if manipulation arbitrage is profitable
+     */
+    function isProfitable(ArbitrageParams calldata params) 
+        external 
+        view 
+        returns (bool profitable, uint256 estimatedProfit) 
+    {
+        // Simulate the arbitrage without executing
+        // This is a simplified version - real implementation would use quoter contracts
+        
+        address pool = _getPoolAddress(params.tokenA, params.tokenB, params.fee);
+        if (pool == address(0)) return (false, 0);
+        
+        // Estimate profit (simplified calculation)
+        uint256 flashLoanCost = params.flashAmount * FLASH_LOAN_FEE / BASIS_POINTS;
+        uint256 estimatedGain = params.flashAmount * 200 / BASIS_POINTS; // Assume 2% gain
+        
+        if (estimatedGain > flashLoanCost + params.minProfit) {
+            profitable = true;
+            estimatedProfit = estimatedGain - flashLoanCost;
+        }
+    }
+
+    /**
+     * @dev Emergency functions
+     */
+    function emergencyWithdraw(address token) external onlyOwner {
+        IERC20(token).safeTransfer(owner(), IERC20(token).balanceOf(address(this)));
+    }
+
+    function emergencyWithdrawETH() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+
+    /**
+     * @dev Configuration functions
+     */
+    function setMinProfitBasisPoints(uint256 _minProfit) external onlyOwner {
+        require(_minProfit <= 1000, "Max 10%"); // Max 10%
+        minProfitBasisPoints = _minProfit;
+    }
+
+    function setMaxSlippageBasisPoints(uint256 _maxSlippage) external onlyOwner {
+        require(_maxSlippage <= 1000, "Max 10%"); // Max 10%
+        maxSlippageBasisPoints = _maxSlippage;
+    }
+
+    // Receive ETH
+    receive() external payable {}
+}

@@ -24,13 +24,13 @@ module.exports = {
   },
   
   networks: {
-    hardhat: {
-      chainId: 31337,
-      gas: 12000000,
-      blockGasLimit: 12000000,
-      allowUnlimitedContractSize: true,
-      timeout: 1800000,
-    },
+    // hardhat: {
+    //   chainId: 31337,
+    //   gas: 12000000,
+    //   blockGasLimit: 12000000,
+    //   allowUnlimitedContractSize: true,
+    //   timeout: 1800000,
+    // },
 
     // Sepolia testnet - VERIFIED WORKING URL
     sepolia: PRIVATE_KEY && ALCHEMY_API_KEY ? {
@@ -43,17 +43,17 @@ module.exports = {
       confirmations: 1, // Faster for testnet
     } : undefined,
 
-    // // Mainnet - VERIFIED WORKING
-    // mainnet: PRIVATE_KEY && ALCHEMY_API_KEY ? {
-    //   url: `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
-    //   accounts: [`0x${cleanPrivateKey}`],
-    //   chainId: 1,
-    //   gas: 'auto',
-    //   gasPrice: 'auto',
-    //   gasMultiplier: 1.2,
-    //   timeout: 600000,
-    //   confirmations: 2,
-    // } : undefined,
+    // Mainnet - VERIFIED WORKING
+    mainnet: PRIVATE_KEY && ALCHEMY_API_KEY ? {
+      url: `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
+      accounts: [`0x${cleanPrivateKey}`],
+      chainId: 1,
+      gas: 'auto',
+      gasPrice: 'auto',
+      gasMultiplier: 1.2,
+      timeout: 600000,
+      confirmations: 2,
+    } : undefined,
   },
 
   gasReporter: {
